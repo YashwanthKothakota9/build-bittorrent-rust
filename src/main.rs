@@ -1,39 +1,55 @@
+use serde_json::Value;
 use std::env;
 
 // Available if you need it!
 // use serde_bencode
 
-#[allow(dead_code)]
-fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
-    // If encoded_value starts with a digit, it's a number
-    if encoded_value.chars().next().unwrap().is_ascii_digit() {
-        // Example: "5:hello" -> "hello"
-        let colon_index = encoded_value.find(':').unwrap();
-        let number_string = &encoded_value[..colon_index];
-        let number = number_string.parse::<i64>().unwrap();
-        let string = &encoded_value[colon_index + 1..colon_index + 1 + number as usize];
-        serde_json::Value::String(string.to_string())
-    } else if encoded_value.starts_with("i") {
-        let final_index = encoded_value.find('e').unwrap();
-        let number_string = &encoded_value[1..final_index];
-        let number = number_string.parse::<i64>().unwrap();
-        serde_json::Value::Number(serde_json::Number::from(number))
-    } else {
-        panic!("Unhandled encoded value: {}", encoded_value)
-    }
+fn decode_bencoded_string(src: &str) -> (Value, usize) {
+    let colon_index = src.find(':').expect("missing colon in string");
+    let len: usize = src[..colon_index].parse().expect("invalid length");
+    let start = colon_index + 1;
+    let end = start + len;
+    let s = &src[start..end];
+    (Value::String(s.to_owned()), end)
 }
 
-// Usage: your_program.sh decode "<encoded_value>"
+fn decode_bencoded_number(src: &str) -> (Value, usize) {
+    let end = src.find('e').expect("missing e in integer");
+    let num: i64 = src[1..end].parse().expect("invalid integer");
+    (Value::Number(num.into()), end + 1)
+}
+
+fn decode_bencoded_list(src: &str) -> (Value, usize) {
+    let mut items = Vec::new();
+    let mut current_index = 1;
+    while src.as_bytes()[current_index] != b'e' {
+        let (item, used) = decode_bencoded_value(&src[current_index..]);
+        items.push(item);
+        current_index += used;
+    }
+    (Value::Array(items), current_index + 1)
+}
+
+fn decode_bencoded_value(src: &str) -> (Value, usize) {
+    match src.chars().next().expect("empty input") {
+        '0'..='9' => decode_bencoded_string(src),
+        'i' => decode_bencoded_number(src),
+        'l' => decode_bencoded_list(src),
+        _ => panic!("Unhandled encoded value: {}", src),
+    }
+}
 fn main() {
     let args: Vec<String> = env::args().collect();
+    if args.len() < 3 {
+        eprintln!("Usage: {} decode <bencoded_value>", args[0]);
+        std::process::exit(1);
+    }
+
     let command = &args[1];
 
     if command == "decode" {
-        // You can use print statements as follows for debugging, they'll be visible when running tests.
-        // eprintln!("Logs from your program will appear here!");
-
         let encoded_value = &args[2];
-        let decoded_value = decode_bencoded_value(encoded_value);
+        let (decoded_value, _) = decode_bencoded_value(encoded_value);
         println!("{}", decoded_value);
     } else {
         println!("unknown command: {}", args[1])
