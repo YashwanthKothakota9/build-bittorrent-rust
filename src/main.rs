@@ -1,4 +1,4 @@
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::env;
 
 // Available if you need it!
@@ -19,6 +19,29 @@ fn decode_bencoded_number(src: &str) -> (Value, usize) {
     (Value::Number(num.into()), end + 1)
 }
 
+fn decode_bencoded_dict(src: &str) -> (Value, usize) {
+    let mut items: Map<String, Value> = Map::new();
+    let mut current_index = 1;
+
+    while src.as_bytes()[current_index] != b'e' {
+        // Keys must be strings in bencoded dictionaries
+        let (key_val, used) = decode_bencoded_string(&src[current_index..]);
+        current_index += used;
+
+        let key = match key_val {
+            Value::String(s) => s,
+            _ => unreachable!("Dictionary keys must be strings"),
+        };
+
+        let (value, used) = decode_bencoded_value(&src[current_index..]);
+        current_index += used;
+
+        items.insert(key, value);
+    }
+
+    (Value::Object(items), current_index + 1)
+}
+
 fn decode_bencoded_list(src: &str) -> (Value, usize) {
     let mut items = Vec::new();
     let mut current_index = 1;
@@ -35,6 +58,7 @@ fn decode_bencoded_value(src: &str) -> (Value, usize) {
         '0'..='9' => decode_bencoded_string(src),
         'i' => decode_bencoded_number(src),
         'l' => decode_bencoded_list(src),
+        'd' => decode_bencoded_dict(src),
         _ => panic!("Unhandled encoded value: {}", src),
     }
 }
