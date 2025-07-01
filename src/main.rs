@@ -1,67 +1,108 @@
 use serde_json::{Map, Value};
-use std::env;
+use std::{env, fs::File, io::Read};
 
 // Available if you need it!
 // use serde_bencode
 
-fn decode_bencoded_string(src: &str) -> (Value, usize) {
-    let colon_index = src.find(':').expect("missing colon in string");
-    let len: usize = src[..colon_index].parse().expect("invalid length");
-    let start = colon_index + 1;
+fn parse_usize(bytes: &[u8]) -> (usize, usize) {
+    let mut num: usize = 0;
+    let mut idx = 0;
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        num = num * 10 + (bytes[idx] - b'0') as usize;
+        idx += 1;
+    }
+    (num, idx)
+}
+
+fn decode_string_bytes(src: &[u8]) -> (Value, usize) {
+    let (len, digits) = parse_usize(src);
+    let start = digits + 1;
     let end = start + len;
-    let s = &src[start..end];
-    (Value::String(s.to_owned()), end)
+    let slice = &src[start..end];
+    let s = String::from_utf8_lossy(slice).into_owned();
+    (Value::String(s), end)
 }
 
-fn decode_bencoded_number(src: &str) -> (Value, usize) {
-    let end = src.find('e').expect("missing e in integer");
-    let num: i64 = src[1..end].parse().expect("invalid integer");
-    (Value::Number(num.into()), end + 1)
+fn decode_number_bytes(src: &[u8]) -> (Value, usize) {
+    let mut idx = 1;
+    let neg = if src[idx] == b'-' {
+        idx += 1;
+        true
+    } else {
+        false
+    };
+    let (num, digits) = parse_usize(&src[idx..]);
+    idx += digits;
+
+    let mut num_i64 = num as i64;
+    if neg {
+        num_i64 = -num_i64;
+    }
+    (Value::Number(num_i64.into()), idx + 1)
 }
 
-fn decode_bencoded_dict(src: &str) -> (Value, usize) {
-    let mut items: Map<String, Value> = Map::new();
-    let mut current_index = 1;
+fn decode_list_bytes(src: &[u8]) -> (Value, usize) {
+    let mut items = Vec::new();
+    let mut idx = 1;
+    while src[idx] != b'e' {
+        let (val, used) = decode_value_bytes(&src[idx..]);
+        items.push(val);
+        idx += used;
+    }
+    (Value::Array(items), idx + 1)
+}
 
-    while src.as_bytes()[current_index] != b'e' {
-        // Keys must be strings in bencoded dictionaries
-        let (key_val, used) = decode_bencoded_string(&src[current_index..]);
-        current_index += used;
-
+fn decode_dict_bytes(src: &[u8]) -> (Value, usize) {
+    let mut map: Map<String, Value> = Map::new();
+    let mut idx = 1;
+    while src[idx] != b'e' {
+        let (key_val, used_key) = decode_string_bytes(&src[idx..]);
+        idx += used_key;
         let key = match key_val {
             Value::String(s) => s,
-            _ => unreachable!("Dictionary keys must be strings"),
+            _ => unreachable!(),
         };
-
-        let (value, used) = decode_bencoded_value(&src[current_index..]);
-        current_index += used;
-
-        items.insert(key, value);
+        let (val, used_val) = decode_value_bytes(&src[idx..]);
+        idx += used_val;
+        map.insert(key, val);
     }
-
-    (Value::Object(items), current_index + 1)
+    (Value::Object(map), idx + 1)
 }
 
-fn decode_bencoded_list(src: &str) -> (Value, usize) {
-    let mut items = Vec::new();
-    let mut current_index = 1;
-    while src.as_bytes()[current_index] != b'e' {
-        let (item, used) = decode_bencoded_value(&src[current_index..]);
-        items.push(item);
-        current_index += used;
+fn decode_value_bytes(src: &[u8]) -> (Value, usize) {
+    match src[0] {
+        b'0'..=b'9' => decode_string_bytes(src),
+        b'i' => decode_number_bytes(src),
+        b'l' => decode_list_bytes(src),
+        b'd' => decode_dict_bytes(src),
+        other => panic!("unsupported type byte: {}", other as char),
     }
-    (Value::Array(items), current_index + 1)
 }
 
-fn decode_bencoded_value(src: &str) -> (Value, usize) {
-    match src.chars().next().expect("empty input") {
-        '0'..='9' => decode_bencoded_string(src),
-        'i' => decode_bencoded_number(src),
-        'l' => decode_bencoded_list(src),
-        'd' => decode_bencoded_dict(src),
-        _ => panic!("Unhandled encoded value: {}", src),
-    }
+fn get_file_info(file_name: &str) -> String {
+    let mut file = File::open(file_name).expect("Failed to open torrent file");
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).expect("Failed to read file");
+
+    let (torrent_val, _) = decode_value_bytes(&bytes);
+
+    let announce = torrent_val
+        .as_object()
+        .and_then(|m| m.get("announce"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unknown>");
+
+    let length = torrent_val
+        .as_object()
+        .and_then(|m| m.get("info"))
+        .and_then(|info| info.as_object())
+        .and_then(|im| im.get("length"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+
+    format!("Tracker URL: {}\nLength: {}", announce, length)
 }
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
@@ -73,8 +114,12 @@ fn main() {
 
     if command == "decode" {
         let encoded_value = &args[2];
-        let (decoded_value, _) = decode_bencoded_value(encoded_value);
+        let (decoded_value, _) = decode_value_bytes(encoded_value.as_bytes());
         println!("{}", decoded_value);
+    } else if command == "info" {
+        let file_name = &args[2];
+        let file_info = get_file_info(file_name);
+        println!("{}", file_info);
     } else {
         println!("unknown command: {}", args[1])
     }
