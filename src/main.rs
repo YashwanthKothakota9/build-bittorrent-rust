@@ -1,4 +1,5 @@
 use serde_json::{Map, Value};
+use sha1::{Digest, Sha1};
 use std::{env, fs::File, io::Read};
 
 // Available if you need it!
@@ -100,7 +101,24 @@ fn get_file_info(file_name: &str) -> String {
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
 
-    format!("Tracker URL: {}\nLength: {}", announce, length)
+    let tag = b"4:info";
+    let key_pos = bytes
+        .windows(tag.len())
+        .position(|w| w == tag)
+        .expect("indo dict not found in .torrent file");
+
+    let val_start = key_pos + tag.len();
+    let (_, val_len) = decode_value_bytes(&bytes[val_start..]);
+    let info_bytes = &bytes[val_start..val_start + val_len];
+
+    let mut hasher = Sha1::new();
+    hasher.update(info_bytes);
+    let info_hash = hasher.finalize();
+
+    format!(
+        "Tracker URL: {}\nLength: {}\nInfo Hash: {:x}",
+        announce, length, info_hash
+    )
 }
 
 fn main() {
