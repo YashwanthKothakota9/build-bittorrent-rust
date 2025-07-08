@@ -101,6 +101,36 @@ fn get_file_info(file_name: &str) -> String {
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
 
+    let piece_length = torrent_val
+        .as_object()
+        .and_then(|m| m.get("info"))
+        .and_then(|info| info.as_object())
+        .and_then(|im| im.get("piece length"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+
+    // Extract raw pieces bytes directly from the torrent file
+    let pieces_tag = b"6:pieces";
+    let pieces_pos = bytes
+        .windows(pieces_tag.len())
+        .position(|w| w == pieces_tag)
+        .expect("pieces field not found in .torrent file");
+
+    let pieces_value_start = pieces_pos + pieces_tag.len();
+    let (pieces_len, len_digits) = parse_usize(&bytes[pieces_value_start..]);
+    let pieces_data_start = pieces_value_start + len_digits + 1; // +1 for the ':'
+    let pieces_data = &bytes[pieces_data_start..pieces_data_start + pieces_len];
+
+    let piece_hashes = pieces_data
+        .chunks(20)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+
     let tag = b"4:info";
     let key_pos = bytes
         .windows(tag.len())
@@ -116,8 +146,12 @@ fn get_file_info(file_name: &str) -> String {
     let info_hash = hasher.finalize();
 
     format!(
-        "Tracker URL: {}\nLength: {}\nInfo Hash: {:x}",
-        announce, length, info_hash
+        "Tracker URL: {}\nLength: {}\nInfo Hash: {:x}\nPiece Length: {}\nPiece Hashes:\n{}",
+        announce,
+        length,
+        info_hash,
+        piece_length,
+        piece_hashes.join("\n")
     )
 }
 
