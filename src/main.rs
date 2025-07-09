@@ -1,9 +1,25 @@
+use reqwest::blocking;
 use serde_json::{Map, Value};
 use sha1::{Digest, Sha1};
 use std::{env, fs::File, io::Read};
 
 // Available if you need it!
 // use serde_bencode
+
+fn url_encode_bytes(bytes: &[u8]) -> String {
+    let mut result = String::new();
+    for &byte in bytes {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                result.push(byte as char);
+            }
+            _ => {
+                result.push_str(&format!("%{:02X}", byte));
+            }
+        }
+    }
+    result
+}
 
 fn parse_usize(bytes: &[u8]) -> (usize, usize) {
     let mut num: usize = 0;
@@ -155,6 +171,105 @@ fn get_file_info(file_name: &str) -> String {
     )
 }
 
+fn get_info_hash_bytes(file_name: &str) -> Vec<u8> {
+    let mut file = File::open(file_name).expect("Failed to open torrent file");
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).expect("Failed to read file");
+
+    let tag = b"4:info";
+    let key_pos = bytes
+        .windows(tag.len())
+        .position(|w| w == tag)
+        .expect("info dict not found in .torrent file");
+
+    let val_start = key_pos + tag.len();
+    let (_, val_len) = decode_value_bytes(&bytes[val_start..]);
+    let info_bytes = &bytes[val_start..val_start + val_len];
+
+    let mut hasher = Sha1::new();
+    hasher.update(info_bytes);
+    hasher.finalize().to_vec()
+}
+
+fn get_peers(file_name: &str) -> Vec<String> {
+    // Extract torrent info
+    let mut file = File::open(file_name).expect("Failed to open torrent file");
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).expect("Failed to read file");
+
+    let (torrent_val, _) = decode_value_bytes(&bytes);
+
+    let announce = torrent_val
+        .as_object()
+        .and_then(|m| m.get("announce"))
+        .and_then(|v| v.as_str())
+        .expect("Failed to get announce URL");
+
+    let length = torrent_val
+        .as_object()
+        .and_then(|m| m.get("info"))
+        .and_then(|info| info.as_object())
+        .and_then(|im| im.get("length"))
+        .and_then(|v| v.as_i64())
+        .expect("Failed to get file length") as usize;
+
+    // Get info hash as raw bytes
+    let info_hash = get_info_hash_bytes(file_name);
+
+    // URL encode the info hash
+    let info_hash_encoded = url_encode_bytes(&info_hash);
+
+    // Build query parameters
+    let query_params = [
+        ("info_hash", info_hash_encoded.to_string()),
+        ("peer_id", "00112233445566778899".to_string()),
+        ("port", "6881".to_string()),
+        ("uploaded", "0".to_string()),
+        ("downloaded", "0".to_string()),
+        ("left", length.to_string()),
+        ("compact", "1".to_string()),
+    ];
+
+    // Build full URL with query parameters
+    let mut url = announce.to_string();
+    url.push('?');
+    for (i, (key, value)) in query_params.iter().enumerate() {
+        if i > 0 {
+            url.push('&');
+        }
+        url.push_str(&format!("{}={}", key, value));
+    }
+
+    // Make HTTP request
+    let response = blocking::get(&url).expect("Failed to make HTTP request");
+    let response_bytes = response.bytes().expect("Failed to get response bytes");
+
+    // Extract raw peers bytes directly from the bencoded response
+    let peers_tag = b"5:peers";
+    let peers_pos = response_bytes
+        .windows(peers_tag.len())
+        .position(|w| w == peers_tag)
+        .expect("peers field not found in tracker response");
+
+    let peers_value_start = peers_pos + peers_tag.len();
+    let (peers_len, len_digits) = parse_usize(&response_bytes[peers_value_start..]);
+    let peers_data_start = peers_value_start + len_digits + 1; // +1 for the ':'
+    let peers_data = &response_bytes[peers_data_start..peers_data_start + peers_len];
+
+    // Convert peers data to IP:PORT format
+    let mut peers = Vec::new();
+
+    for chunk in peers_data.chunks(6) {
+        if chunk.len() == 6 {
+            let ip = format!("{}.{}.{}.{}", chunk[0], chunk[1], chunk[2], chunk[3]);
+            let port = ((chunk[4] as u16) << 8) | (chunk[5] as u16);
+            peers.push(format!("{}:{}", ip, port));
+        }
+    }
+
+    peers
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
@@ -172,6 +287,12 @@ fn main() {
         let file_name = &args[2];
         let file_info = get_file_info(file_name);
         println!("{}", file_info);
+    } else if command == "peers" {
+        let file_name = &args[2];
+        let peers = get_peers(file_name);
+        for peer in peers {
+            println!("{}", peer);
+        }
     } else {
         println!("unknown command: {}", args[1])
     }
