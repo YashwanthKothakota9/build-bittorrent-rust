@@ -1,7 +1,8 @@
+use rand::Rng;
 use reqwest::blocking;
 use serde_json::{Map, Value};
 use sha1::{Digest, Sha1};
-use std::{env, fs::File, io::Read};
+use std::{env, fs::File, io::Read, io::Write, net::TcpStream};
 
 // Available if you need it!
 // use serde_bencode
@@ -270,6 +271,65 @@ fn get_peers(file_name: &str) -> Vec<String> {
     peers
 }
 
+fn handshake(file_name: &str, peer_addr: &str) -> String {
+    // Parse peer address
+    let parts: Vec<&str> = peer_addr.split(':').collect();
+    if parts.len() != 2 {
+        panic!("Invalid peer address format. Expected IP:PORT");
+    }
+    let ip = parts[0];
+    let port: u16 = parts[1].parse().expect("Invalid port number");
+
+    // Get info hash from torrent file
+    let info_hash = get_info_hash_bytes(file_name);
+
+    // Generate random peer ID (20 bytes)
+    let mut rng = rand::thread_rng();
+    let peer_id: Vec<u8> = (0..20).map(|_| rng.gen()).collect();
+
+    // Build handshake message (68 bytes total)
+    let mut handshake_msg = Vec::with_capacity(68);
+
+    // 1 byte: length of protocol string (19)
+    handshake_msg.push(19u8);
+
+    // 19 bytes: "BitTorrent protocol"
+    handshake_msg.extend_from_slice(b"BitTorrent protocol");
+
+    // 8 bytes: reserved (all zeros)
+    handshake_msg.extend_from_slice(&[0u8; 8]);
+
+    // 20 bytes: info hash
+    handshake_msg.extend_from_slice(&info_hash);
+
+    // 20 bytes: peer ID
+    handshake_msg.extend_from_slice(&peer_id);
+
+    // Connect to peer via TCP
+    let mut stream =
+        TcpStream::connect(format!("{}:{}", ip, port)).expect("Failed to connect to peer");
+
+    // Send handshake
+    stream
+        .write_all(&handshake_msg)
+        .expect("Failed to send handshake");
+
+    // Receive handshake response (also 68 bytes)
+    let mut response = [0u8; 68];
+    stream
+        .read_exact(&mut response)
+        .expect("Failed to receive handshake response");
+
+    // Extract peer ID from response (bytes 48-67)
+    let received_peer_id = &response[48..68];
+
+    // Convert to hex and return
+    received_peer_id
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>()
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
@@ -293,6 +353,15 @@ fn main() {
         for peer in peers {
             println!("{}", peer);
         }
+    } else if command == "handshake" {
+        if args.len() < 4 {
+            eprintln!("Usage: {} handshake <torrent_file> <peer_ip:port>", args[0]);
+            std::process::exit(1);
+        }
+        let file_name = &args[2];
+        let peer_addr = &args[3];
+        let peer_id = handshake(file_name, peer_addr);
+        println!("Peer ID: {}", peer_id);
     } else {
         println!("unknown command: {}", args[1])
     }
