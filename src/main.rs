@@ -442,6 +442,13 @@ fn get_torrent_metadata(file_name: &str) -> (u64, u64) {
     (length, piece_length)
 }
 
+// Helper function to calculate total number of pieces in the torrent
+fn get_total_pieces(file_name: &str) -> usize {
+    let (total_length, piece_length) = get_torrent_metadata(file_name);
+    // Use ceiling division to get total pieces
+    ((total_length + piece_length - 1) / piece_length) as usize
+}
+
 // Helper function to get the expected SHA1 hash for a specific piece index
 fn get_piece_hash(file_name: &str, piece_index: usize) -> Vec<u8> {
     let mut file = File::open(file_name).expect("Failed to open torrent file");
@@ -717,6 +724,304 @@ fn download_piece(torrent_file: &str, piece_index: usize, output_file: &str) {
         .expect("Failed to write piece data to file");
 }
 
+// Modified version of download_piece that returns piece data in memory instead of saving to file
+fn download_piece_to_memory(torrent_file: &str, piece_index: usize) -> Vec<u8> {
+    // Get list of peers from tracker
+    let peers = get_peers(torrent_file);
+    if peers.is_empty() {
+        panic!("No peers found");
+    }
+
+    // Connect to first peer and perform handshake
+    let peer_addr = &peers[0];
+
+    // Parse peer address
+    let parts: Vec<&str> = peer_addr.split(':').collect();
+    if parts.len() != 2 {
+        panic!("Invalid peer address format. Expected IP:PORT");
+    }
+    let ip = parts[0];
+    let port: u16 = parts[1].parse().expect("Invalid port number");
+
+    // Get info hash from torrent file
+    let info_hash = get_info_hash_bytes(torrent_file);
+
+    // Generate random peer ID (20 bytes)
+    let mut rng = rand::thread_rng();
+    let peer_id: Vec<u8> = (0..20).map(|_| rng.gen()).collect();
+
+    // Build handshake message (68 bytes total)
+    let mut handshake_msg = Vec::with_capacity(68);
+    handshake_msg.push(19u8); // length of protocol string
+    handshake_msg.extend_from_slice(b"BitTorrent protocol"); // 19 bytes
+    handshake_msg.extend_from_slice(&[0u8; 8]); // 8 bytes reserved
+    handshake_msg.extend_from_slice(&info_hash); // 20 bytes info hash
+    handshake_msg.extend_from_slice(&peer_id); // 20 bytes peer ID
+
+    // Connect to peer via TCP
+    let mut stream =
+        TcpStream::connect(format!("{}:{}", ip, port)).expect("Failed to connect to peer");
+
+    // Send handshake
+    stream
+        .write_all(&handshake_msg)
+        .expect("Failed to send handshake");
+
+    // Receive handshake response (also 68 bytes)
+    let mut response = [0u8; 68];
+    stream
+        .read_exact(&mut response)
+        .expect("Failed to receive handshake response");
+
+    // Read bitfield message from peer
+    let bitfield_msg = read_peer_message(&mut stream).expect("Failed to read bitfield message");
+
+    // Verify it's a bitfield message
+    if bitfield_msg.id != BITFIELD_ID {
+        panic!(
+            "Expected bitfield message (ID: {}), got ID: {}",
+            BITFIELD_ID, bitfield_msg.id
+        );
+    }
+
+    // Send interested message to peer
+    let interested_msg = PeerMessage::new_empty(INTERESTED_ID);
+    write_peer_message(&mut stream, &interested_msg).expect("Failed to send interested message");
+
+    // Wait for unchoke message from peer
+    let unchoke_msg = read_peer_message(&mut stream).expect("Failed to read unchoke message");
+
+    // Verify it's an unchoke message
+    if unchoke_msg.id != UNCHOKE_ID {
+        panic!(
+            "Expected unchoke message (ID: {}), got ID: {}",
+            UNCHOKE_ID, unchoke_msg.id
+        );
+    }
+
+    // Calculate how many 16KB blocks are needed for this piece
+    let (total_length, piece_length) = get_torrent_metadata(torrent_file);
+
+    // Calculate the actual size of this specific piece
+    let total_pieces = (total_length + piece_length - 1) / piece_length; // Round up division
+    let this_piece_length = if piece_index == (total_pieces - 1) as usize {
+        // Last piece might be smaller
+        let remainder = total_length % piece_length;
+        if remainder == 0 {
+            piece_length
+        } else {
+            remainder
+        }
+    } else {
+        // Normal piece
+        piece_length
+    };
+
+    // Calculate blocks (16KB = 16384 bytes each)
+    const BLOCK_SIZE: u64 = 16 * 1024; // 16KB
+    let num_blocks = (this_piece_length + BLOCK_SIZE - 1) / BLOCK_SIZE; // Round up division
+
+    // Store block information for request messages
+    let mut blocks = Vec::new();
+    for block_index in 0..num_blocks {
+        let begin = block_index * BLOCK_SIZE;
+        let length = if block_index == num_blocks - 1 {
+            // Last block might be smaller
+            this_piece_length - begin
+        } else {
+            // Normal block
+            BLOCK_SIZE
+        };
+        blocks.push((begin, length));
+    }
+
+    // Send request messages for each block
+    for (_block_index, (begin, length)) in blocks.iter().enumerate() {
+        // Create request message payload (12 bytes total)
+        let mut payload = Vec::with_capacity(12);
+
+        // 4 bytes: piece index (big-endian u32)
+        payload.extend_from_slice(&(piece_index as u32).to_be_bytes());
+
+        // 4 bytes: begin offset (big-endian u32)
+        payload.extend_from_slice(&(*begin as u32).to_be_bytes());
+
+        // 4 bytes: length (big-endian u32)
+        payload.extend_from_slice(&(*length as u32).to_be_bytes());
+
+        // Create and send request message
+        let request_msg = PeerMessage::new(REQUEST_ID, payload);
+        write_peer_message(&mut stream, &request_msg).expect("Failed to send request message");
+    }
+
+    // Receive piece messages containing block data
+    let mut received_blocks: HashMap<u64, Vec<u8>> = HashMap::new();
+
+    for _block_index in 0..blocks.len() {
+        let piece_msg = read_peer_message(&mut stream).expect("Failed to read piece message");
+
+        // Verify it's a piece message
+        if piece_msg.id != PIECE_ID {
+            panic!(
+                "Expected piece message (ID: {}), got ID: {}",
+                PIECE_ID, piece_msg.id
+            );
+        }
+
+        // Parse piece message payload
+        if piece_msg.payload.len() < 8 {
+            panic!(
+                "Piece message payload too short: {} bytes",
+                piece_msg.payload.len()
+            );
+        }
+
+        // Extract fields from payload
+        let received_piece_index = u32::from_be_bytes([
+            piece_msg.payload[0],
+            piece_msg.payload[1],
+            piece_msg.payload[2],
+            piece_msg.payload[3],
+        ]) as usize;
+
+        let received_begin = u32::from_be_bytes([
+            piece_msg.payload[4],
+            piece_msg.payload[5],
+            piece_msg.payload[6],
+            piece_msg.payload[7],
+        ]) as u64;
+
+        let block_data = &piece_msg.payload[8..];
+
+        // Verify this is the piece we requested
+        if received_piece_index != piece_index {
+            panic!(
+                "Received piece index {} but expected {}",
+                received_piece_index, piece_index
+            );
+        }
+
+        // Store block data by its begin offset
+        received_blocks.insert(received_begin, block_data.to_vec());
+    }
+
+    // Combine all blocks in correct order to form complete piece
+    let total_piece_size: usize = blocks.iter().map(|(_, length)| *length as usize).sum();
+    let mut complete_piece = Vec::with_capacity(total_piece_size);
+
+    // Combine blocks in correct order (using original blocks sequence)
+    for (_block_index, (begin_offset, expected_length)) in blocks.iter().enumerate() {
+        // Retrieve block data from HashMap
+        let block_data = received_blocks
+            .get(begin_offset)
+            .expect(&format!("Missing block data for offset {}", begin_offset));
+
+        // Verify block size matches expectation
+        if block_data.len() != *expected_length as usize {
+            panic!(
+                "Block size mismatch: expected {} bytes, got {} bytes for offset {}",
+                expected_length,
+                block_data.len(),
+                begin_offset
+            );
+        }
+
+        // Append block data to complete piece
+        complete_piece.extend_from_slice(block_data);
+    }
+
+    // Verify final piece size
+    if complete_piece.len() != total_piece_size {
+        panic!(
+            "Final piece size mismatch: expected {} bytes, got {} bytes",
+            total_piece_size,
+            complete_piece.len()
+        );
+    }
+
+    // Verify piece hash matches torrent file
+    let mut hasher = Sha1::new();
+    hasher.update(&complete_piece);
+    let calculated_hash = hasher.finalize().to_vec();
+
+    let expected_hash = get_piece_hash(torrent_file, piece_index);
+
+    if calculated_hash != expected_hash {
+        panic!(
+            "Hash mismatch!\nExpected: {}\nCalculated: {}",
+            expected_hash
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>(),
+            calculated_hash
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()
+        );
+    }
+
+    // Return the verified piece data instead of saving to file
+    complete_piece
+}
+
+// Function to download all pieces of a torrent file sequentially
+fn download_all_pieces(torrent_file: &str) -> Vec<Vec<u8>> {
+    let total_pieces = get_total_pieces(torrent_file);
+    let mut all_pieces = Vec::with_capacity(total_pieces);
+
+    println!("Downloading {} pieces...", total_pieces);
+
+    for piece_index in 0..total_pieces {
+        println!("Downloading piece {} of {}", piece_index + 1, total_pieces);
+        let piece_data = download_piece_to_memory(torrent_file, piece_index);
+        all_pieces.push(piece_data);
+    }
+
+    println!("Successfully downloaded all {} pieces", total_pieces);
+    all_pieces
+}
+
+// Function to combine all pieces into a single file and write to output path
+fn combine_pieces_to_file(pieces: Vec<Vec<u8>>, output_file: &str) {
+    println!(
+        "Combining {} pieces into file: {}",
+        pieces.len(),
+        output_file
+    );
+
+    // Calculate total file size for progress info
+    let total_size: usize = pieces.iter().map(|piece| piece.len()).sum();
+    println!("Total file size: {} bytes", total_size);
+
+    // Create output file
+    let mut file = File::create(output_file).expect("Failed to create output file");
+
+    // Write each piece to the file in order
+    for (index, piece) in pieces.iter().enumerate() {
+        file.write_all(piece)
+            .expect(&format!("Failed to write piece {} to output file", index));
+    }
+
+    // Ensure all data is written to disk
+    file.flush().expect("Failed to flush output file");
+
+    println!("Successfully wrote complete file to: {}", output_file);
+}
+
+// Main function to download entire torrent file
+fn download_file(torrent_file: &str, output_file: &str) {
+    println!("Starting download of torrent file: {}", torrent_file);
+    println!("Output will be saved to: {}", output_file);
+
+    // Download all pieces to memory
+    let all_pieces = download_all_pieces(torrent_file);
+
+    // Combine pieces and write to output file
+    combine_pieces_to_file(all_pieces, output_file);
+
+    println!("Download completed successfully!");
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
@@ -769,6 +1074,25 @@ fn main() {
         let piece_index: usize = args[5].parse().expect("Invalid piece index");
 
         download_piece(torrent_file, piece_index, output_file);
+    } else if command == "download" {
+        if args.len() < 5 {
+            eprintln!(
+                "Usage: {} download -o <output_file> <torrent_file>",
+                args[0]
+            );
+            std::process::exit(1);
+        }
+
+        // Check for -o flag
+        if &args[2] != "-o" {
+            eprintln!("Expected -o flag, got: {}", args[2]);
+            std::process::exit(1);
+        }
+
+        let output_file = &args[3];
+        let torrent_file = &args[4];
+
+        download_file(torrent_file, output_file);
     } else {
         println!("unknown command: {}", args[1])
     }
